@@ -1,0 +1,689 @@
+#!/usr/bin/env bash
+# Libera RAM, /tmp (tmpfs no Ubuntu 26.04) e disco presos por builds de desenvolvimento: Gradle, Kotlin,
+# Metro, Jest, Expo, EAS local, caches de yarn/npm/Gradle e lixeiras escondidas de apps snap.
+# Nunca mexe em build em andamento: daemons BUSY e working dirs do EAS em uso ficam. A exceção é o --watch
+# com a RAM acabando: aí derruba os builds, porque perder um build é melhor que a máquina travar.
+
+set -uo pipefail
+
+DRY_RUN=0
+REFRESH_SWAP=0
+WATCH=0
+TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+MAX_AGE_MIN="${DEV_CLEANUP_MAX_AGE_MIN:-120}"
+WATCH_INTERVAL_S=15
+# Proporcionais à RAM: numa máquina de 32 GB, aviso com ~6 GB livres e crítico com ~3 GB.
+WARN_AVAIL_MB="${DEV_CLEANUP_WARN_MB:-$((TOTAL_MB * 3 / 16))}"
+CRIT_AVAIL_MB="${DEV_CLEANUP_CRIT_MB:-$((TOTAL_MB * 3 / 32))}"
+CRIT_PSI_FULL="${DEV_CLEANUP_CRIT_PSI:-20}"
+NOTIFY_MIN_MB="${DEV_CLEANUP_NOTIFY_MIN_MB:-100}"
+TRASH_WARN_GB="${DEV_CLEANUP_TRASH_WARN_GB:-5}"
+TRASH_CHECK_EVERY_H=12
+CACHE_MAX_GB="${DEV_CLEANUP_CACHE_MAX_GB:-2}"
+GRADLE_UNUSED_DAYS="${DEV_CLEANUP_GRADLE_UNUSED_DAYS:-30}"
+CACHES_CHECK_EVERY_H=24
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dev-cleanup"
+APP_NAME="Limpeza de memória"
+TRASH_PROMPT_UNIT=dev-cleanup-trash-prompt
+TRASH_PROMPT=()
+USER_TMP="/tmp/$USER"
+USER_TMP_ON_DISK="$HOME/.cache/user-tmp"
+EAS_WORKDIRS=("$USER_TMP/eas-build-local-nodejs" "$HOME/.cache/eas-build-local")
+GRADLE_DAEMON_PATTERN='org.gradle.launcher.daemon.bootstrap.GradleDaemon'
+KOTLIN_DAEMON_PATTERN='org.jetbrains.kotlin.daemon.KotlinCompileDaemon'
+BUILD_COMMS=" clang clang++ cc1 cc1plus ld ld.lld lld ninja cmake make aapt2 "
+BUILD_JAVA_PATTERN="$GRADLE_DAEMON_PATTERN|$KOTLIN_DAEMON_PATTERN|GradleWorkerMain"
+KEPT_GRADLE_DAEMONS=0
+declare -A FREED_KB=() FREED_COUNT=()
+
+usage() {
+  cat <<EOF
+Uso: dev-cleanup [opções]
+
+  -n, --dry-run      mostra o que seria limpo, sem limpar nada
+      --max-age MIN  idade mínima dos temporários removidos, em minutos (padrão: $MAX_AGE_MIN)
+      --swap         devolve o swap para a RAM com swapoff/swapon (pede sudo)
+      --watch        fica vigiando a memória a cada ${WATCH_INTERVAL_S}s e põe builds (Gradle, Kotlin, ninja,
+                     clang) na menor prioridade de CPU e disco (usado pelo serviço dev-cleanup-watch)
+  -h, --help         mostra esta ajuda
+
+Limites do --watch, em MB de RAM disponível (variáveis de ambiente; padrão proporcional aos $TOTAL_MB MB de RAM):
+  DEV_CLEANUP_WARN_MB=$WARN_AVAIL_MB   abaixo disso limpa o que está ocioso e avisa
+  DEV_CLEANUP_CRIT_MB=$CRIT_AVAIL_MB   abaixo disso derruba os daemons Gradle/Kotlin, mesmo em uso
+  DEV_CLEANUP_CRIT_PSI=$CRIT_PSI_FULL    % do tempo travado esperando memória (PSI full avg10) que, abaixo
+                         do limite de aviso, também conta como crítico
+
+Notificação "Liberou X MB" só a partir de DEV_CLEANUP_NOTIFY_MIN_MB=$NOTIFY_MIN_MB MB.
+Uma vez por dia: zera os caches do yarn e do npm acima de DEV_CLEANUP_CACHE_MAX_GB=$CACHE_MAX_GB GB e apaga os caches
+de versões do Gradle sem uso há DEV_CLEANUP_GRADLE_UNUSED_DAYS=$GRADLE_UNUSED_DAYS dias.
+Avisa quando as lixeiras escondidas dos apps snap passam de DEV_CLEANUP_TRASH_WARN_GB=$TRASH_WARN_GB GB. O aviso
+tem um botão Esvaziar, que pede confirmação antes; o script nunca esvazia a lixeira sozinho.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n | --dry-run) DRY_RUN=1 ;;
+    --max-age)
+      MAX_AGE_MIN="$2"
+      shift
+      ;;
+    --swap) REFRESH_SWAP=1 ;;
+    --watch) WATCH=1 ;;
+    # Interno: o aviso com botão da lixeira, disparado pelo próprio script numa unit à parte.
+    --trash-prompt)
+      TRASH_PROMPT=("$2" "$3" "$4")
+      shift 3
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Opção desconhecida: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "    [dry-run] $*"
+  else
+    "$@"
+  fi
+}
+
+memory_summary() {
+  free -m | awk '/^Mem/ {avail = $7} /^Swap/ {swap = $3} END {printf "RAM disponível %d MB | swap em uso %d MB | /tmp ", avail, swap}'
+  df -h --output=used /tmp | tail -1 | tr -d ' '
+}
+
+# Soma o que foi liberado por tipo, para a notificação no fim.
+count_freed() {
+  local kind=$1 kb=$2
+  FREED_KB[$kind]=$((${FREED_KB[$kind]:-0} + kb))
+  FREED_COUNT[$kind]=$((${FREED_COUNT[$kind]:-0} + 1))
+}
+
+reset_freed() {
+  FREED_KB=()
+  FREED_COUNT=()
+}
+
+freed_total_kb() {
+  local kind total=0
+  for kind in "${!FREED_KB[@]}"; do
+    total=$((total + FREED_KB[$kind]))
+  done
+  echo "$total"
+}
+
+# 736 -> "736 MB", 5427 -> "5,3 GB"
+fmt_mb() {
+  local mb=$1 tenths
+  if [ "$mb" -lt 1024 ]; then
+    echo "$mb MB"
+  else
+    tenths=$((mb * 10 / 1024))
+    echo "$((tenths / 10)),$((tenths % 10)) GB"
+  fi
+}
+
+# Uma linha só, do maior para o menor: o GNOME junta as linhas quando a notificação está recolhida.
+join_dots() {
+  awk -F'\t' '{printf "%s%s", (NR > 1 ? " · " : ""), $NF}'
+}
+
+freed_summary() {
+  local kind count
+  for kind in "${!FREED_KB[@]}"; do
+    count=${FREED_COUNT[$kind]}
+    [ "$count" -gt 1 ] && count=" ×$count" || count=""
+    printf '%d\t%s%s %s\n' "${FREED_KB[$kind]}" "$kind" "$count" "$(fmt_mb $((FREED_KB[$kind] / 1024)))"
+  done | sort -rn | join_dots
+}
+
+freed_line() {
+  local total_kb
+  total_kb=$(freed_total_kb)
+  if [ "$total_kb" -gt 0 ]; then
+    echo "Liberei <b>$(fmt_mb $((total_kb / 1024)))</b>: $(freed_summary)."
+  else
+    echo "Nada ocioso para limpar."
+  fi
+}
+
+# Arquivo apagado do /tmp (tmpfs) é RAM devolvida; o $USER_TMP aponta para o disco e não conta.
+in_ram() {
+  [[ "$1" == /tmp/* ]] && [ "$(findmnt -n -o FSTYPE /tmp 2>/dev/null)" = tmpfs ] &&
+    ! { [ -L "$USER_TMP" ] && [[ "$1" == "$USER_TMP"/* ]]; }
+}
+
+remove_path() {
+  local kb
+  kb=$(du -sk "$1" 2>/dev/null | cut -f1)
+  echo "  $(numfmt --to=iec $((${kb:-0} * 1024)))	$1"
+  run rm -rf -- "$1" && in_ram "$1" && count_freed "temporários" "${kb:-0}"
+}
+
+# pgrep -f também casa com shells e editores que só mencionam o padrão na linha de comando;
+# daemon de verdade é sempre um processo java.
+java_pids() {
+  ps -u "$USER" -o pid=,comm=,args= | awk -v pattern="$1" '$2 == "java" && $0 ~ pattern {print $1}'
+}
+
+stop_idle_gradle_daemons() {
+  echo "== Daemons Gradle ociosos"
+  local pid rss gradle_home gradle_homes status idle_pids busy_count
+  KEPT_GRADLE_DAEMONS=0
+  gradle_homes=$(for pid in $(java_pids "$GRADLE_DAEMON_PATTERN"); do
+    tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -oE '/[^:]*/gradle-[0-9][^/:]*/lib/' | head -1 | sed 's#/lib/$##'
+  done | sort -u)
+  if [ -z "$gradle_homes" ]; then
+    echo "  nenhum rodando"
+    return
+  fi
+  for gradle_home in $gradle_homes; do
+    if ! status=$(timeout 60 "$gradle_home/bin/gradle" --status 2>/dev/null); then
+      echo "  $(basename "$gradle_home"): --status falhou, mantendo os daemons dessa versão"
+      KEPT_GRADLE_DAEMONS=$((KEPT_GRADLE_DAEMONS + $(pgrep -u "$USER" -fc "$gradle_home/lib/.*$GRADLE_DAEMON_PATTERN")))
+      continue
+    fi
+    idle_pids=$(awk '$2 == "IDLE" {print $1}' <<<"$status")
+    busy_count=$(awk '$2 == "BUSY"' <<<"$status" | wc -l)
+    KEPT_GRADLE_DAEMONS=$((KEPT_GRADLE_DAEMONS + busy_count))
+    echo "  $(basename "$gradle_home"): $(wc -w <<<"$idle_pids") ocioso(s), $busy_count em uso"
+    for pid in $idle_pids; do
+      rss=$(ps -o rss= -p "$pid") || continue
+      echo "  encerrando $pid ($((rss / 1024)) MB)"
+      run kill "$pid" && count_freed "Gradle ocioso" "$rss"
+    done
+  done
+}
+
+# O daemon Kotlin é iniciado pelo daemon Gradle, mas sobrevive a ele por horas.
+stop_orphan_kotlin_daemons() {
+  echo "== Daemons Kotlin órfãos"
+  local pids pid rss
+  pids=$(java_pids "$KOTLIN_DAEMON_PATTERN")
+  if [ -z "$pids" ]; then
+    echo "  nenhum rodando"
+    return
+  fi
+  if [ "$KEPT_GRADLE_DAEMONS" -gt 0 ]; then
+    echo "  ainda há daemon Gradle em uso, mantendo"
+    return
+  fi
+  for pid in $pids; do
+    rss=$(ps -o rss= -p "$pid") || continue
+    echo "  encerrando $pid ($((rss / 1024)) MB)"
+    run kill "$pid" && count_freed "Kotlin órfão" "$rss"
+  done
+}
+
+# Dev server, jest e tsserver cujo terminal ou editor morreu são adotados pelo systemd --user e ficam lá
+# para sempre. Só pega processos de apps (.scope); serviços do usuário (.service) são de propósito e ficam.
+stop_orphan_node_processes() {
+  echo "== Processos Node órfãos"
+  local reapers pid ppid etimes rss args exe found=0
+  reapers=" 1 $(pgrep -u "$USER" -x systemd | tr '\n' ' ')"
+  while read -r pid ppid etimes rss args; do
+    [[ "$reapers" == *" $ppid "* ]] || continue
+    [ "$etimes" -ge 600 ] || continue
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    [[ "$exe" == */node || "$exe" == */"node (deleted)" ]] || continue
+    grep -q '\.scope$' "/proc/$pid/cgroup" 2>/dev/null || continue
+    [[ "$args" == *eas-cli* ]] && continue
+    found=1
+    echo "  encerrando $pid ($((rss / 1024)) MB) ${args:0:100}"
+    run kill "$pid" && count_freed "Node órfão" "$rss"
+  done < <(ps -u "$USER" -o pid=,ppid=,etimes=,rss=,args=)
+  [ "$found" = 1 ] || echo "  nenhum"
+}
+
+# Build não tem pressa e o desktop tem: compilador, ninja, Gradle e Kotlin rodam com a menor prioridade de CPU
+# e de disco. Com a máquina livre o build anda no mesmo ritmo; com ela ocupada, quem espera é o build. Um build
+# nativo de React Native põe um clang++ por núcleo em paralelo e leva a carga ao dobro do número de núcleos.
+# Nice no Linux é por thread: renice no PID só pega a thread principal, e o Gradle cria processos a partir
+# de outras threads (os filhos herdam o nice de quem os criou). Por isso vai thread por thread.
+deprioritize_builds() {
+  local pids tids
+  pids=$(ps -u "$USER" -o pid=,comm=,args= | awk -v comms="$BUILD_COMMS" -v java="$BUILD_JAVA_PATTERN" \
+    'index(comms, " " $2 " ") || ($2 == "java" && $0 ~ java) {print $1}' | paste -sd,)
+  [ -n "$pids" ] || return 0
+  tids=$(ps -L -o tid=,ni= -p "$pids" | awk '$2 < 19 {print $1}')
+  [ -n "$tids" ] || return 0
+  # shellcheck disable=SC2086
+  run renice -n 19 -p $tids >/dev/null 2>&1
+  # shellcheck disable=SC2086
+  run ionice -c 2 -n 7 -p $tids 2>/dev/null
+  echo "Prioridade mínima: $(ps -o comm= -p "$pids" | sort | uniq -c |
+    awk '{printf "%s%s ×%d", sep, $2, $1; sep = ", "}') ($(wc -w <<<"$tids") threads)"
+}
+
+# Último recurso do --watch: com a RAM acabando, perder um build é melhor que a máquina travar.
+kill_build_daemons() {
+  local pids pid rss
+  pids=$(java_pids "$GRADLE_DAEMON_PATTERN|$KOTLIN_DAEMON_PATTERN" | tr '\n' ' ')
+  [ -n "$pids" ] || return 1
+  echo "  encerrando daemons Gradle/Kotlin, mesmo em uso: $pids"
+  for pid in $pids; do
+    rss=$(ps -o rss= -p "$pid") && count_freed "build Gradle/Kotlin" "$rss"
+  done
+  # shellcheck disable=SC2086
+  run kill $pids
+  [ "$DRY_RUN" = 1 ] && return 0
+  sleep 5
+  # shellcheck disable=SC2086
+  kill -9 $pids 2>/dev/null
+  return 0
+}
+
+remove_old_files_in() {
+  local dir=$1 bytes
+  [ -d "$dir" ] || return
+  bytes=$(find "$dir" -type f -mmin +"$MAX_AGE_MIN" -printf '%s\n' 2>/dev/null | awk '{sum += $1} END {print sum + 0}')
+  [ "$bytes" -eq 0 ] && return
+  echo "  $(numfmt --to=iec "$bytes")	$dir (arquivos antigos)"
+  run find "$dir" -type f -mmin +"$MAX_AGE_MIN" -delete && in_ram "$dir" &&
+    count_freed "temporários" $((bytes / 1024))
+  run find "$dir" -mindepth 1 -type d -empty -delete
+}
+
+clean_tmp() {
+  echo "== Temporários de build com mais de $MAX_AGE_MIN min"
+  local path
+  # Template do projeto que o expo prebuild extrai a cada execução.
+  while IFS= read -r path; do
+    [ -f "$path/app.json" ] && [ -d "$path/android" ] && remove_path "$path"
+  done < <(find /tmp -maxdepth 1 -type d -user "$USER" -mmin +"$MAX_AGE_MIN" -regextype posix-extended -regex '/tmp/[0-9a-f]{32}')
+  # Bundle JS gerado pelo expo export:embed nos builds release.
+  while IFS= read -r path; do
+    [ -f "$path/index.js" ] && [ -d "$path/assets" ] && remove_path "$path"
+  done < <(find /tmp -maxdepth 1 -type d -user "$USER" -mmin +"$MAX_AGE_MIN" -regextype posix-extended -regex '/tmp/[a-z0-9]{10,12}')
+  while IFS= read -r path; do
+    remove_path "$path"
+  done < <(find /tmp -maxdepth 1 -user "$USER" -mmin +"$MAX_AGE_MIN" \( -name 'metro-file-map-*' -o -name 'haste-map-*' -o -name 'kotlin-daemon.*.log' -o -name 'react-native-packager-cache-*' \))
+  for path in /tmp/metro-cache /tmp/jest_*; do
+    remove_old_files_in "$path"
+  done
+}
+
+# O eas-cli build --local monta o working dir em /tmp/$USER (via env-paths). Com /tmp em tmpfs, o projeto,
+# o node_modules instalado e a saída do Gradle de cada build vão inteiros para a RAM. O symlink manda tudo
+# para o disco sem mudar o comando do build, e cada build continua com o seu próprio diretório.
+ensure_user_tmp_on_disk() {
+  [ -L "$USER_TMP" ] && return
+  [ "$(findmnt -n -o FSTYPE /tmp 2>/dev/null)" = tmpfs ] || return
+  echo "== $USER_TMP -> $USER_TMP_ON_DISK"
+  if [ -d "$USER_TMP" ] && [ -n "$(ls -A "$USER_TMP")" ]; then
+    echo "  $USER_TMP já tem arquivos, fica na RAM até o próximo boot"
+    return
+  fi
+  [ -d "$USER_TMP" ] && run rmdir "$USER_TMP"
+  run mkdir -p -m 700 "$USER_TMP_ON_DISK"
+  run ln -s "$USER_TMP_ON_DISK" "$USER_TMP"
+}
+
+clean_eas_workdirs() {
+  echo "== Working dirs do EAS local"
+  if pgrep -u "$USER" -f eas-cli-local-build-plugin >/dev/null; then
+    echo "  build do EAS em andamento, mantendo"
+    return
+  fi
+  local base path
+  for base in "${EAS_WORKDIRS[@]}"; do
+    [ -d "$base" ] || continue
+    for path in "$base"/*; do
+      [ -e "$path" ] && remove_path "$path"
+    done
+  done
+}
+
+# Apagar o cache no meio de um install quebra o install. Rodar o app (yarn android, npm run dev) não importa.
+package_install_running() {
+  ps -u "$USER" -o args= |
+    grep -qE '(yarn(\.js)?|yarnpkg)( (install|add|upgrade)( |$)|$)|npm-cli\.js (install|i|ci|add|update)( |$)|pnpm (install|add|i)( |$)'
+}
+
+# Caches de pacotes crescem para sempre: yarn e npm guardam cada versão já baixada, e o Gradle guarda um cache
+# inteiro (GBs) por versão do Gradle, mesmo depois de nenhum projeto usar mais. Tudo volta sozinho no próximo
+# install ou build.
+clean_dev_caches() {
+  local stamp="$STATE_DIR/dev-caches-checked" dir path kb version freed_kb=0
+  # Pelo timer, no máximo uma vez por dia: o du em centenas de milhares de arquivos não é de graça.
+  if [ "${DEV_CLEANUP_TIMER:-0}" = 1 ] && [ -f "$stamp" ] &&
+    ((EPOCHSECONDS - $(stat -c %Y "$stamp") < CACHES_CHECK_EVERY_H * 3600)); then
+    return
+  fi
+  echo "== Caches de pacotes e do Gradle (disco)"
+  if package_install_running; then
+    echo "  install de pacotes em andamento, deixando para a próxima"
+    return
+  fi
+
+  for dir in "$HOME/.cache/yarn" "$HOME/.npm/_cacache"; do
+    [ -d "$dir" ] || continue
+    kb=$(du -sk "$dir" 2>/dev/null | cut -f1)
+    [ "${kb:-0}" -gt $((CACHE_MAX_GB * 1048576)) ] || continue
+    remove_path "$dir"
+    freed_kb=$((freed_kb + kb))
+  done
+
+  for dir in "$HOME"/.gradle/caches/[0-9]*/; do
+    [ -d "$dir" ] || continue
+    dir=${dir%/}
+    version=$(basename "$dir")
+    [ -n "$(java_pids "gradle-$version/lib/.*$GRADLE_DAEMON_PATTERN")" ] && continue
+    [ -n "$(find "$dir" -newermt "$GRADLE_UNUSED_DAYS days ago" -print -quit 2>/dev/null)" ] && continue
+    for path in "$dir" "$HOME"/.gradle/wrapper/dists/gradle-"$version"-*; do
+      [ -e "$path" ] || continue
+      kb=$(du -sk "$path" 2>/dev/null | cut -f1)
+      remove_path "$path"
+      freed_kb=$((freed_kb + ${kb:-0}))
+    done
+  done
+
+  [ "$DRY_RUN" = 1 ] || { mkdir -p "$STATE_DIR" && touch "$stamp"; }
+  [ "$freed_kb" -gt 0 ] || { echo "  nada acima do limite"; return; }
+  echo "  disco liberado: $(fmt_mb $((freed_kb / 1024)))"
+  [ "$freed_kb" -ge 1048576 ] &&
+    notify normal "🧹 Liberou $(fmt_mb $((freed_kb / 1024))) de disco" \
+      "Caches de yarn, npm e versões antigas do Gradle. Voltam sozinhos se algum projeto precisar." dialog-information
+  return 0
+}
+
+refresh_swap() {
+  echo "== Swap"
+  local avail swap_used
+  read -r avail swap_used < <(free -m | awk '/^Mem/ {a = $7} /^Swap/ {s = $3} END {print a, s}')
+  if [ "$swap_used" -eq 0 ]; then
+    echo "  vazio"
+    return
+  fi
+  if [ "$avail" -lt $((swap_used + 2048)) ]; then
+    echo "  só $avail MB de RAM disponível para absorver $swap_used MB de swap, pulando"
+    return
+  fi
+  echo "  devolvendo $swap_used MB para a RAM (pode levar alguns minutos)"
+  run sudo swapoff -a && run sudo swapon -a
+}
+
+# App snap (o VS Code, por exemplo) tem lixeira própria em ~/snap/<app>/<revisão>/.local/share/Trash: fica fora
+# da lixeira do GNOME, nunca é esvaziada e é copiada inteira a cada atualização do snap. Apagar node_modules e
+# android pelo explorador do VS Code já acumulou 160 GB numa máquina sem ninguém perceber. O script só avisa;
+# quem esvazia é o botão do aviso, depois de confirmar.
+snap_trash_dirs() {
+  find "$HOME/snap" -mindepth 5 -maxdepth 5 -type d -path '*/.local/share/Trash' 2>/dev/null
+}
+
+check_snap_trash() {
+  local stamp="$STATE_DIR/snap-trash-checked" path kb total_kb=0 details="" name rev biggest="" biggest_kb=0
+  # Pelo timer, no máximo a cada 12h: o du em milhões de arquivos de node_modules não é de graça.
+  if [ "${DEV_CLEANUP_TIMER:-0}" = 1 ] && [ -f "$stamp" ] &&
+    ((EPOCHSECONDS - $(stat -c %Y "$stamp") < TRASH_CHECK_EVERY_H * 3600)); then
+    return
+  fi
+  echo "== Lixeiras escondidas de apps snap"
+  while IFS= read -r path; do
+    kb=$(du -sk "$path" 2>/dev/null | cut -f1)
+    [ "${kb:-0}" -ge 1024 ] || continue
+    total_kb=$((total_kb + kb))
+    if [ "$kb" -gt "$biggest_kb" ]; then
+      biggest_kb=$kb
+      biggest=$path
+    fi
+    rev=${path#"$HOME/snap/"}
+    name=${rev%%/*}
+    rev=${rev#*/}
+    rev=${rev%%/*}
+    echo "  $(fmt_mb $((kb / 1024)))	$path"
+    details+="${details:+ · }$name (rev $rev) $(fmt_mb $((kb / 1024)))"
+  done < <(snap_trash_dirs)
+  [ "$DRY_RUN" = 1 ] || { mkdir -p "$STATE_DIR" && touch "$stamp"; }
+  if [ "$total_kb" -lt $((TRASH_WARN_GB * 1048576)) ]; then
+    [ "$total_kb" -gt 0 ] || echo "  vazias"
+    return
+  fi
+  echo "  total $(fmt_mb $((total_kb / 1024))), acima de $TRASH_WARN_GB GB"
+  if can_ask; then
+    ask_to_empty_snap_trash "$(fmt_mb $((total_kb / 1024)))" "$details" "$biggest"
+  else
+    notify normal "🗑️ Lixeira escondida: $(fmt_mb $((total_kb / 1024))) no disco" \
+      "${details}."$'\n'"Fica fora da lixeira do GNOME. Para esvaziar: rm -rf ~/snap/*/*/.local/share/Trash" user-trash-full
+  fi
+}
+
+# O aviso com botão precisa de python3-gi (para ouvir o clique) e do zenity (para confirmar).
+can_ask() {
+  command -v zenity >/dev/null && python3 -c 'import gi' 2>/dev/null
+}
+
+# O botão espera o clique, então o aviso roda numa unit à parte: o serviço do timer termina na hora e, com o
+# nome fixo, nunca ficam dois avisos pendentes ao mesmo tempo.
+ask_to_empty_snap_trash() {
+  local args=(--trash-prompt "$@")
+  [ "$DRY_RUN" = 1 ] && args=(-n "${args[@]}")
+  if systemctl --user is-active --quiet "$TRASH_PROMPT_UNIT"; then
+    echo "  o aviso anterior ainda está aberto"
+    return
+  fi
+  systemd-run --user --quiet --collect --unit="$TRASH_PROMPT_UNIT" -p Nice=10 -p IOSchedulingClass=idle \
+    "$(readlink -f "$0")" "${args[@]}"
+}
+
+# O notify-send 0.8.8 recusa botões no GNOME 50 ("Actions are not supported") mesmo com o servidor anunciando
+# a capacidade 'actions'. E o GNOME só manda o clique para a conexão D-Bus que criou o aviso, então gdbus call
+# + gdbus monitor não serve: quem cria o aviso precisa ficar ouvindo. Daí o Python.
+# Uso: notify_with_actions TÍTULO CORPO nome1 Rótulo1 [nome2 Rótulo2...]
+# Imprime o nome do botão clicado, ou nada se o aviso foi fechado.
+notify_with_actions() {
+  APP_NAME="$APP_NAME" python3 - "$@" <<'PY'
+import os, sys
+from gi.repository import Gio, GLib
+
+title, body, actions = sys.argv[1], sys.argv[2], sys.argv[3:]
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+loop = GLib.MainLoop()
+state = {"id": None, "action": ""}
+
+def on_signal(_conn, _sender, _path, _iface, signal, params):
+    if params[0] != state["id"]:
+        return
+    if signal == "ActionInvoked":
+        state["action"] = params[1]
+    loop.quit()
+
+for signal in ("ActionInvoked", "NotificationClosed"):
+    bus.signal_subscribe("org.freedesktop.Notifications", "org.freedesktop.Notifications", signal,
+                         "/org/freedesktop/Notifications", None, Gio.DBusSignalFlags.NONE, on_signal)
+reply = bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                      "org.freedesktop.Notifications", "Notify",
+                      GLib.Variant("(susssasa{sv}i)", (os.environ["APP_NAME"], 0, "user-trash-full", title, body,
+                                                       actions, {"urgency": GLib.Variant("y", 1)}, -1)),
+                      GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, -1, None)
+state["id"] = reply.unpack()[0]
+loop.run()
+print(state["action"])
+PY
+}
+
+trash_prompt() {
+  local total=$1 details=$2 biggest=$3 prefix="" action
+  [ "$DRY_RUN" = 1 ] && prefix="[dry-run] "
+  while true; do
+    action=$(notify_with_actions "${prefix}🗑️ Lixeira escondida: $total no disco" \
+      "${details}."$'\n'"Fica fora da lixeira do GNOME e nunca é esvaziada." \
+      open "Ver arquivos" empty "Esvaziar")
+    case "$action" in
+      # Depois de abrir a pasta, mostra o aviso de novo para dar para esvaziar depois de olhar.
+      open) gio open "$biggest/files" ;;
+      empty)
+        confirm_empty "$total" && empty_snap_trash "$total"
+        return
+        ;;
+      *) return ;;
+    esac
+  done
+}
+
+confirm_empty() {
+  zenity --question --default-cancel --icon=user-trash-full --title="Esvaziar lixeira escondida" \
+    --ok-label="Apagar" --cancel-label="Cancelar" \
+    --text="Apagar definitivamente $1 das lixeiras dos apps snap?\n\nNão dá para desfazer." 2>/dev/null
+}
+
+empty_snap_trash() {
+  local total=$1 prefix="" id path
+  [ "$DRY_RUN" = 1 ] && prefix="[dry-run] "
+  id=$(notify-send -p -a "$APP_NAME" -i user-trash-full "${prefix}🗑️ Esvaziando a lixeira escondida…" \
+    "Apagando $total. Pode levar alguns minutos.")
+  # Busca de novo na hora de apagar, em vez de confiar na lista de quando o aviso apareceu.
+  while IFS= read -r path; do
+    echo "apagando $path"
+    run rm -rf -- "$path"
+  done < <(snap_trash_dirs)
+  notify-send -r "$id" -a "$APP_NAME" -i user-trash "${prefix}🗑️ Lixeira esvaziada" \
+    "<b>$total</b> liberados. Agora: <b>$(df -BG --output=avail "$HOME" | tail -1 | tr -dc '0-9') GB livres</b> no disco."
+}
+
+report_long_running() {
+  echo "== Processos de dev rodando há mais de 4h (só aviso, não encerro)"
+  ps -u "$USER" -o pid=,etimes=,rss=,args= |
+    awk '$2 > 14400 && /expo start|metro|react-native start|qemu-system|emulator -avd/ {
+      printf "  %s  %dh  %d MB  ", $1, $2 / 3600, $3 / 1024
+      $1 = $2 = $3 = ""
+      print substr($0, 4, 100)
+    }'
+}
+
+# Lê direto do /proc, sem criar processo: roda a cada poucos segundos, inclusive com a máquina travando.
+read_memory() {
+  local key value _ avail=0 swap_total=0 swap_free=0
+  while read -r key value _; do
+    case "$key" in
+      MemAvailable:) avail=$value ;;
+      SwapTotal:) swap_total=$value ;;
+      SwapFree:) swap_free=$value ;;
+    esac
+  done </proc/meminfo
+  AVAIL_MB=$((avail / 1024))
+  SWAP_USED_MB=$(((swap_total - swap_free) / 1024))
+  PSI_FULL=0
+  while read -r key value _; do
+    if [ "$key" = full ]; then
+      PSI_FULL=${value#avg10=}
+      PSI_FULL=${PSI_FULL%.*}
+    fi
+  done </proc/pressure/memory
+}
+
+# Os 3 apps que mais ocupam RAM, somando todos os processos de cada um (o Chrome tem dezenas).
+top_consumers() {
+  local mb name
+  ps -u "$USER" -o rss=,comm= |
+    awk '{rss = $1; $1 = ""; mem[substr($0, 2)] += rss} END {for (c in mem) printf "%d\t%s\n", mem[c] / 1024, c}' |
+    sort -rn | head -3 |
+    while IFS=$'\t' read -r mb name; do
+      name=${name//&/&amp;}
+      name=${name//</&lt;}
+      printf '%s\t%s %s\n' "$mb" "${name//>/&gt;}" "$(fmt_mb "$mb")"
+    done | join_dots
+}
+
+notify() {
+  local urgency=$1 title=$2 body=$3 icon=${4:-dialog-warning}
+  [ "$DRY_RUN" = 1 ] && title="[dry-run] $title"
+  notify-send -a "$APP_NAME" -u "$urgency" -i "$icon" "$title" "$body" 2>/dev/null || true
+}
+
+# O mínimo evita que o timer de 30 min avise toda vez que apaga meia dúzia de logs.
+notify_freed() {
+  local total_kb
+  total_kb=$(freed_total_kb)
+  echo "Liberado: $((total_kb / 1024)) MB"
+  [ "$total_kb" -ge $((NOTIFY_MIN_MB * 1024)) ] || return 0
+  read_memory
+  notify normal "🧹 Liberou $(fmt_mb $((total_kb / 1024))) de RAM" \
+    "$(freed_summary)."$'\n'"Agora: <b>$(fmt_mb "$AVAIL_MB") livres</b>." dialog-information
+}
+
+cleanup() {
+  reset_freed
+  stop_idle_gradle_daemons
+  stop_orphan_kotlin_daemons
+  stop_orphan_node_processes
+  clean_tmp
+  clean_eas_workdirs
+}
+
+# Um build pesado leva o swap de 0 a 13 GB em menos de 10 min: o timer de 30 min não pega um pico desses.
+watch_memory() {
+  echo "Vigiando a memória a cada ${WATCH_INTERVAL_S}s: aviso abaixo de $WARN_AVAIL_MB MB," \
+    "crítico abaixo de $CRIT_AVAIL_MB MB ou com PSI full >= $CRIT_PSI_FULL%"
+  local last_cleanup=0 last_notify=0 killed
+  while true; do
+    [ -e "$USER_TMP" ] || ensure_user_tmp_on_disk
+    deprioritize_builds
+    read_memory
+    if [ "$AVAIL_MB" -lt "$CRIT_AVAIL_MB" ] ||
+      { [ "$PSI_FULL" -ge "$CRIT_PSI_FULL" ] && [ "$AVAIL_MB" -lt "$WARN_AVAIL_MB" ]; }; then
+      echo "CRÍTICO: RAM disponível $AVAIL_MB MB | swap em uso $SWAP_USED_MB MB | PSI full $PSI_FULL%"
+      reset_freed
+      killed=""
+      kill_build_daemons && killed="<b>Build Gradle/Kotlin interrompido</b> para a máquina não travar."$'\n'
+      stop_orphan_node_processes
+      echo "Liberado: $(($(freed_total_kb) / 1024)) MB"
+      if [ -n "$killed" ] || ((EPOCHSECONDS - last_notify >= 180)); then
+        notify critical "Memória crítica: $(fmt_mb "$AVAIL_MB") livres" \
+          "${killed}$(freed_line)"$'\n'"Maiores: $(top_consumers)."
+        last_notify=$EPOCHSECONDS
+      fi
+      last_cleanup=$EPOCHSECONDS
+      # Dá tempo para a memória ser devolvida antes de reavaliar e matar mais coisa.
+      sleep 60
+      continue
+    fi
+    if [ "$AVAIL_MB" -lt "$WARN_AVAIL_MB" ] && ((EPOCHSECONDS - last_cleanup >= 300)); then
+      echo "AVISO: RAM disponível $AVAIL_MB MB | swap em uso $SWAP_USED_MB MB"
+      cleanup
+      last_cleanup=$EPOCHSECONDS
+      sleep 3
+      read_memory
+      if [ "$AVAIL_MB" -lt "$WARN_AVAIL_MB" ] && ((EPOCHSECONDS - last_notify >= 600)); then
+        echo "Liberado: $(($(freed_total_kb) / 1024)) MB"
+        notify normal "⚠️ Memória baixa: $(fmt_mb "$AVAIL_MB") livres" \
+          "$(freed_line)"$'\n'"Maiores: $(top_consumers)."
+        last_notify=$EPOCHSECONDS
+      else
+        notify_freed
+      fi
+    fi
+    sleep "$WATCH_INTERVAL_S"
+  done
+}
+
+[ "$DRY_RUN" = 1 ] && echo "(dry-run: nada será alterado)"
+if [ ${#TRASH_PROMPT[@]} -gt 0 ]; then
+  trash_prompt "${TRASH_PROMPT[@]}"
+  exit
+fi
+ensure_user_tmp_on_disk
+if [ "$WATCH" = 1 ]; then
+  watch_memory
+  exit
+fi
+echo "Antes:  $(memory_summary)"
+cleanup
+[ "$REFRESH_SWAP" = 1 ] && refresh_swap
+report_long_running
+clean_dev_caches
+check_snap_trash
+if [ "$DRY_RUN" = 0 ]; then
+  sleep 3
+  echo "Depois: $(memory_summary)"
+fi
+notify_freed

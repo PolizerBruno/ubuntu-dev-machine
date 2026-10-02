@@ -1,0 +1,11 @@
+[Unit]
+Description=Limpa daemons ociosos, temporários e caches de builds antigos
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/dev-cleanup
+# Diz ao script que veio do timer (checagens pesadas espaçadas). Não dá para usar INVOCATION_ID: apps que
+# rodam como serviço do systemd (o desktop do Claude, por exemplo) passam essa variável para os terminais.
+Environment=DEV_CLEANUP_TIMER=1
+Nice=10
+IOSchedulingClass=idle

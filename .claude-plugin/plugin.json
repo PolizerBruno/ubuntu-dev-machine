@@ -1,0 +1,23 @@
+{
+  "name": "ubuntu-dev-machine",
+  "version": "0.1.0",
+  "description": "Diagnostica e corrige máquinas Ubuntu de desenvolvimento: memória e builds (Gradle, React Native, EAS), disco (caches, lixeiras escondidas de snaps), Slack no Wayland e Android Emulator no GNOME.",
+  "author": {
+    "name": "PolizerBruno",
+    "url": "https://github.com/PolizerBruno"
+  },
+  "homepage": "https://github.com/PolizerBruno/ubuntu-dev-machine",
+  "repository": "https://github.com/PolizerBruno/ubuntu-dev-machine",
+  "license": "MIT",
+  "keywords": [
+    "ubuntu",
+    "gnome",
+    "wayland",
+    "gradle",
+    "react-native",
+    "android-emulator",
+    "slack",
+    "snap",
+    "memory"
+  ]
+}

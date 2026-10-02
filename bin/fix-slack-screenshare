@@ -1,0 +1,98 @@
+#!/bin/bash
+# Compartilhamento de tela do Slack (snap) no Wayland. O snap carrega a libpipewire do runtime GNOME que ele
+# mesmo monta, mas não aponta PIPEWIRE_CONFIG_DIR para o client.conf desse runtime, e a base core24 não tem
+# /usr/share/pipewire. Sem a configuração, o WebRTC falha com "Failed to create PipeWire context" e o Slack
+# mostra "Verifique as preferências do sistema para permitir o compartilhamento de tela".
+#
+# A correção é um atalho do usuário (~/.local/share/applications/slack_slack.desktop), cópia do atalho do
+# snap com a variável no Exec; o GNOME usa o atalho do usuário no lugar do original (dock, menu e links
+# slack://). Não dá para pôr a variável em environment.d: fora do snap esse caminho não existe e quebraria
+# os outros apps.
+
+set -euo pipefail
+
+SRC=/var/lib/snapd/desktop/applications/slack_slack.desktop
+DST="$HOME/.local/share/applications/slack_slack.desktop"
+CONF_DIR=/snap/slack/current/gnome-platform/usr/share/pipewire
+MARK="# ubuntu-dev-machine: fix-slack-screenshare"
+
+usage() {
+  cat <<EOF
+Uso: fix-slack-screenshare [--check | --remove]
+
+  (sem opção)  aplica a correção se o Slack snap precisar dela
+  --check      só diz se precisa, sem mudar nada
+  --remove     desfaz (apaga o atalho criado por este script)
+EOF
+}
+
+# 0 = precisa da correção, 1 = não precisa; o motivo vai para a saída.
+needs_fix() {
+  if [ ! -f "$SRC" ]; then
+    echo "Slack não está instalado como snap; nada a fazer."
+    return 1
+  fi
+  if grep -q PIPEWIRE_CONFIG_DIR /snap/slack/current/meta/snap.yaml 2>/dev/null; then
+    echo "O snap do Slack já define PIPEWIRE_CONFIG_DIR; nada a fazer."
+    return 1
+  fi
+  if timeout 15 snap run --shell slack -c 'test -f /usr/share/pipewire/client.conf' 2>/dev/null; then
+    echo "O Slack já encontra o client.conf do PipeWire; nada a fazer."
+    return 1
+  fi
+  if ! timeout 15 snap run --shell slack -c "test -f $CONF_DIR/client.conf" 2>/dev/null; then
+    echo "O runtime GNOME do snap não tem client.conf em $CONF_DIR; esta correção não se aplica."
+    return 1
+  fi
+  echo "O Slack snap não encontra o client.conf do PipeWire: o compartilhamento de tela falha no Wayland."
+  return 0
+}
+
+case "${1:-}" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  --remove)
+    if [ -f "$DST" ] && grep -qF "$MARK" "$DST"; then
+      rm -f "$DST"
+      update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+      echo "Atalho removido; feche o Slack (Ctrl+Q) e abra de novo."
+    else
+      echo "Nenhum atalho criado por este script em $DST."
+    fi
+    exit 0
+    ;;
+  --check)
+    needs_fix && grep -qs PIPEWIRE_CONFIG_DIR "$DST" && echo "A correção já está aplicada."
+    exit 0
+    ;;
+  "") ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
+
+needs_fix || exit 0
+if grep -qs PIPEWIRE_CONFIG_DIR "$DST"; then
+  echo "A correção já está aplicada em $DST."
+  exit 0
+fi
+if [ -f "$DST" ] && ! grep -qF "$MARK" "$DST"; then
+  echo "Já existe um atalho seu em $DST que não foi criado por este script; não mexo nele." >&2
+  echo "Ajuste o Exec dele à mão: Exec=env PIPEWIRE_CONFIG_DIR=$CONF_DIR /snap/bin/slack %U" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$DST")"
+{
+  echo "[Desktop Entry]"
+  echo "$MARK"
+  echo "# Cópia de $SRC com PIPEWIRE_CONFIG_DIR no Exec, para o compartilhamento de tela funcionar no Wayland."
+  # Prefixa qualquer Exec: versões antigas do snapd escrevem "Exec=env BAMF_DESKTOP_FILE_HINT=... /snap/bin/slack".
+  grep -v '^\[Desktop Entry\]' "$SRC" | sed "s|^Exec=|Exec=env PIPEWIRE_CONFIG_DIR=$CONF_DIR |"
+} >"$DST"
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+echo "Atalho criado em $DST."
+echo "Feche o Slack de vez (Ctrl+Q na janela) e abra de novo pelo dock ou pelo menu de apps."

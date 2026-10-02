@@ -1,0 +1,9 @@
+[Unit]
+Description=Remove revisões desativadas dos snaps
+After=snapd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/snap-prune-disabled
+Nice=19
+IOSchedulingClass=idle

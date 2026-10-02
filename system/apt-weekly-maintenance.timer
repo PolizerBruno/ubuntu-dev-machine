@@ -1,0 +1,12 @@
+[Unit]
+Description=Atualização semanal do apt, segunda no almoço
+
+[Timer]
+# A máquina costuma ficar desligada de madrugada. No almoço ela está ligada e quase sem uso; se estiver
+# desligada, Persistent roda no próximo boot.
+OnCalendar=Mon 12:30
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

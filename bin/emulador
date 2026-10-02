@@ -1,0 +1,427 @@
+#!/bin/bash
+# Abre um AVD do Android Emulator com padrões que pesam menos na máquina: GPU do host, sem snapshot, sem som
+# e com a tela renderizada em resolução reduzida (mesmo layout em dp). Configurável por variáveis de ambiente.
+set -e
+
+# AVD padrão; vazio usa o primeiro da lista.
+PREFERRED_AVD="${EMULADOR_AVD:-}"
+MEMORY_MB="${EMULADOR_MEMORY_MB:-4096}"
+CORES="${EMULADOR_CORES:-4}"
+
+# Espaço interno do emulador
+DATA_PARTITION_SIZE="${EMULADOR_DATA_PARTITION:-16G}"
+PARTITION_SIZE_MB=$(( ${DATA_PARTITION_SIZE%G} * 1024 ))
+
+# O "Emulator não está respondendo" do GNOME em Wayland é alarme falso e aparece com qualquer GPU
+# (mutter #3543): o emulador responde ao ping em milissegundos, mas a resposta não chega ao GNOME. Resolve com:
+#   gsettings set org.gnome.mutter check-alive-timeout 0
+# host é o mais rápido. guest não existe a partir da API 28: o emulador troca por swiftshader_indirect.
+GPU_MODE="${EMULADOR_GPU:-host}"
+
+# AVDs de aparelhos recentes renderizam 1280x2856 ou mais, mas a janela mostra uns 470x990. Por padrão a tela
+# fica com 720 px de largura e a densidade cai na mesma proporção: o tamanho em dp (o layout dos apps) não
+# muda e a GPU desenha ~68% menos pixels. --hd volta à resolução original, para screenshots em alta.
+LEVE_WIDTH=720
+HD=false
+
+REQUESTED_AVD=""
+CAMERA_MODE="pc"
+REQUESTED_WEBCAM=""
+IMAGE_FILE=""
+WIPE_DATA=false
+
+# O primeiro SDK que tem o emulador: ~/Android/Sdk (padrão do Android Studio) às vezes existe só com
+# platform-tools, enquanto o SDK de verdade está em ~/Android/sdk.
+SDK=""
+for candidate in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Android/Sdk" "$HOME/Android/sdk"; do
+  if [[ -n "$candidate" && -x "$candidate/emulator/emulator" ]]; then
+    SDK="$candidate"
+    break
+  fi
+done
+SDK="${SDK:-${ANDROID_HOME:-$HOME/Android/Sdk}}"
+EMULATOR="$SDK/emulator/emulator"
+
+usage() {
+  cat <<HELP
+Uso:
+  emulador [AVD] [opções]
+
+Exemplos:
+  emulador
+  emulador Pixel_9_Pro
+  emulador Pixel_9_Pro --camera pc
+  emulador Pixel_9_Pro --camera virtual
+  emulador Pixel_9_Pro --camera none
+  emulador Pixel_9_Pro --camera image --image ~/Downloads/barcode.png
+  emulador --gpu swiftshader_indirect
+  emulador --hd
+  emulador --wipe-data
+  emulador --list
+  emulador --webcams
+
+Opções:
+  --camera pc        Usa a câmera física do PC
+  --camera virtual   Usa câmera traseira emulada
+  --camera none      Desliga as câmeras
+  --camera image     Usa uma imagem como câmera traseira
+  --webcam webcam1   Força uma webcam específica
+  --image arquivo    Imagem para barcode/QR code
+  --gpu MODO         host (padrão, placa de vídeo), swiftshader_indirect (por software), auto
+  --hd               Resolução original do aparelho (padrão: reduzida, mesmo layout em dp)
+  --wipe-data        Apaga os dados do AVD e recria a partição com $DATA_PARTITION_SIZE
+  --wipe             Atalho para --wipe-data
+  -l, --list         Lista AVDs
+  --webcams          Lista webcams disponíveis
+  -h, --help         Ajuda
+
+Variáveis de ambiente:
+  EMULADOR_AVD=$PREFERRED_AVD  EMULADOR_MEMORY_MB=$MEMORY_MB  EMULADOR_CORES=$CORES
+  EMULADOR_DATA_PARTITION=$DATA_PARTITION_SIZE  EMULADOR_GPU=$GPU_MODE
+HELP
+}
+
+if [[ ! -x "$EMULATOR" ]]; then
+  echo "Emulator não encontrado em: $EMULATOR"
+  echo "Verifique se ANDROID_HOME está configurado corretamente."
+  exit 1
+fi
+
+list_avds() {
+  "$EMULATOR" -list-avds 2>/dev/null \
+    | grep -E '^[A-Za-z0-9_.-]+$' \
+    | sed '/^$/d'
+}
+
+list_webcams() {
+  "$EMULATOR" -webcam-list 2>/dev/null || true
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -l|--list)
+      list_avds
+      exit 0
+      ;;
+
+    --webcams)
+      list_webcams
+      exit 0
+      ;;
+
+    --camera)
+      if [[ -z "${2:-}" ]]; then
+        echo "Informe o modo da câmera: pc, virtual, none ou image."
+        exit 1
+      fi
+
+      CAMERA_MODE="$2"
+      shift 2
+      ;;
+
+    --webcam)
+      if [[ -z "${2:-}" ]]; then
+        echo "Informe a webcam, por exemplo: --webcam webcam0"
+        exit 1
+      fi
+
+      REQUESTED_WEBCAM="$2"
+      shift 2
+      ;;
+
+    --image)
+      if [[ -z "${2:-}" ]]; then
+        echo "Informe o caminho da imagem."
+        exit 1
+      fi
+
+      IMAGE_FILE="$2"
+      shift 2
+      ;;
+
+    --gpu)
+      case "${2:-}" in
+        host|auto|swiftshader_indirect) GPU_MODE="$2" ;;
+        guest|software) GPU_MODE="swiftshader_indirect" ;;
+        *)
+          echo "Informe o modo da GPU: host, swiftshader_indirect ou auto."
+          exit 1
+          ;;
+      esac
+      shift 2
+      ;;
+
+    --hd)
+      HD=true
+      shift
+      ;;
+
+    --wipe-data|--wipe)
+      WIPE_DATA=true
+      shift
+      ;;
+
+    -h|--help)
+      usage
+      exit 0
+      ;;
+
+    -*)
+      echo "Opção inválida: $1"
+      echo
+      usage
+      exit 1
+      ;;
+
+    *)
+      REQUESTED_AVD="${1#@}"
+      shift
+      ;;
+  esac
+done
+
+AVDS="$(list_avds || true)"
+FIRST_AVD="$(printf "%s\n" "$AVDS" | head -n1)"
+
+if [[ -z "$FIRST_AVD" ]]; then
+  echo "Nenhum AVD encontrado."
+  echo "Crie um emulador pelo Android Studio > Device Manager."
+  exit 1
+fi
+
+if [[ -n "$REQUESTED_AVD" ]]; then
+  AVD="$REQUESTED_AVD"
+
+  if ! printf "%s\n" "$AVDS" | grep -qx "$AVD"; then
+    echo "AVD não encontrado: $AVD"
+    echo
+    echo "Disponíveis:"
+    printf "%s\n" "$AVDS"
+    exit 1
+  fi
+elif [[ -n "$PREFERRED_AVD" ]] && printf "%s\n" "$AVDS" | grep -qx "$PREFERRED_AVD"; then
+  AVD="$PREFERRED_AVD"
+else
+  [[ -n "$PREFERRED_AVD" ]] && echo "AVD padrão '$PREFERRED_AVD' não encontrado."
+  AVD="$FIRST_AVD"
+  echo "Usando o primeiro AVD disponível: $AVD"
+fi
+
+resolve_avd_dir() {
+  local avd_ini="$HOME/.android/avd/${AVD}.ini"
+  local default_dir="$HOME/.android/avd/${AVD}.avd"
+  local configured_path=""
+
+  if [[ -f "$avd_ini" ]]; then
+    configured_path="$(
+      sed -n 's/^path=//p' "$avd_ini" \
+        | head -n1 \
+        | tr -d '\r'
+    )"
+  fi
+
+  if [[ -n "$configured_path" ]]; then
+    printf "%s" "$configured_path"
+  else
+    printf "%s" "$default_dir"
+  fi
+}
+
+AVD_DIR="$(resolve_avd_dir)"
+AVD_CONFIG="$AVD_DIR/config.ini"
+
+if [[ ! -f "$AVD_CONFIG" ]]; then
+  echo "Configuração do AVD não encontrada:"
+  echo "$AVD_CONFIG"
+  exit 1
+fi
+
+# Guarda um backup inicial da configuração; é a referência da resolução original para o --hd.
+if [[ ! -f "${AVD_CONFIG}.backup-emulador" ]]; then
+  cp "$AVD_CONFIG" "${AVD_CONFIG}.backup-emulador"
+fi
+
+set_config() {
+  local key="$1" value="$2" pattern="^${1//./\\.}="
+
+  # | como separador do sed: skin.path tem barras.
+  if grep -q "$pattern" "$AVD_CONFIG"; then
+    sed -i "s|${pattern}.*|$key=$value|" "$AVD_CONFIG"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$AVD_CONFIG"
+  fi
+}
+
+# Valor no config.ini de antes do script mexer (o backup feito na primeira execução).
+original_config() {
+  sed -n "s/^${1//./\\.}=//p" "${AVD_CONFIG}.backup-emulador" \
+    | head -n1 \
+    | tr -d '\r'
+}
+
+# Persiste o tamanho da partição de dados no config.ini.
+set_config disk.dataPartition.size "$DATA_PARTITION_SIZE"
+
+LCD_WIDTH="$(original_config hw.lcd.width)"
+LCD_HEIGHT="$(original_config hw.lcd.height)"
+LCD_DENSITY="$(original_config hw.lcd.density)"
+SKIN_NAME="$(original_config skin.name)"
+SKIN_PATH="$(original_config skin.path)"
+SHOW_FRAME="$(original_config showDeviceFrame)"
+RESOLUTION_LABEL="original"
+SKIN_ARGS=()
+
+if [[ -n "$LCD_WIDTH" && -n "$LCD_HEIGHT" && -n "$LCD_DENSITY" ]]; then
+  if [[ "$HD" == false && "$LCD_WIDTH" -gt "$LEVE_WIDTH" ]]; then
+    # Altura arredondada para par: alguns drivers de vídeo não gostam de dimensão ímpar.
+    LCD_HEIGHT=$(( LCD_HEIGHT * LEVE_WIDTH / LCD_WIDTH / 2 * 2 ))
+    LCD_DENSITY=$(( LCD_DENSITY * LEVE_WIDTH / LCD_WIDTH ))
+    LCD_WIDTH="$LEVE_WIDTH"
+    RESOLUTION_LABEL="leve, sem moldura; --hd para a original"
+    # A moldura do aparelho (skin) fixa a tela na resolução original e ignora hw.lcd.width/height, mas
+    # aplica a densidade nova: o app ficaria quase duas vezes mais largo em dp. Sem moldura, vale o hw.lcd.
+    # Vai no config.ini também, para o Android Studio abrir este AVD no mesmo estado, e não no quebrado.
+    SKIN_NAME="${LCD_WIDTH}x${LCD_HEIGHT}"
+    SKIN_PATH="_no_skin"
+    SHOW_FRAME="no"
+    SKIN_ARGS=(-skin "$SKIN_NAME")
+  fi
+
+  set_config hw.lcd.width "$LCD_WIDTH"
+  set_config hw.lcd.height "$LCD_HEIGHT"
+  set_config hw.lcd.density "$LCD_DENSITY"
+  [[ -n "$SKIN_NAME" ]] && set_config skin.name "$SKIN_NAME"
+  [[ -n "$SKIN_PATH" ]] && set_config skin.path "$SKIN_PATH"
+  [[ -n "$SHOW_FRAME" ]] && set_config showDeviceFrame "$SHOW_FRAME"
+fi
+
+# O recorte da câmera e os cantos arredondados do aparelho vêm de overlays do Android desenhados em pixels
+# da tela original: na tela leve a bolinha da câmera fica enorme e fora do lugar, por cima dos ícones.
+# Sem eles a barra de status fica com a altura padrão (24 dp); para testar layout em volta do recorte, --hd.
+DEVICE_NAME="$(original_config hw.device.name)"
+
+# Roda em segundo plano porque o exec lá embaixo troca este script pelo emulador. Espera o boot, acha o
+# emulador deste AVD (pode haver outros abertos) e liga ou desliga os overlays.
+sync_device_overlays_after_boot() {
+  local action="$1" adb="$SDK/platform-tools/adb" serial i
+  [[ -x "$adb" && -n "$DEVICE_NAME" ]] || return 0
+
+  for i in $(seq 1 120); do
+    for serial in $("$adb" devices 2>/dev/null | awk '/^emulator-/ && $2 == "device" {print $1}'); do
+      [[ "$("$adb" -s "$serial" shell getprop ro.boot.qemu.avd_name 2>/dev/null | tr -d '\r')" == "$AVD" ]] || continue
+      [[ "$("$adb" -s "$serial" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]] || continue
+      "$adb" -s "$serial" shell cmd overlay "$action" "com.android.internal.emulation.$DEVICE_NAME" || true
+      "$adb" -s "$serial" shell cmd overlay "$action" "com.android.systemui.emulation.$DEVICE_NAME" || true
+      return 0
+    done
+    sleep 3
+  done
+}
+
+if [[ ${#SKIN_ARGS[@]} -gt 0 ]]; then
+  OVERLAY_ACTION="disable"
+else
+  OVERLAY_ACTION="enable"
+fi
+
+detect_webcam() {
+  "$EMULATOR" -webcam-list 2>/dev/null \
+    | grep -oE 'webcam[0-9]+' \
+    | head -n1 || true
+}
+
+CAMERA_BACK=""
+CAMERA_FRONT="emulated"
+
+case "$CAMERA_MODE" in
+  pc|webcam)
+    if [[ -n "$REQUESTED_WEBCAM" ]]; then
+      CAMERA_BACK="$REQUESTED_WEBCAM"
+    else
+      CAMERA_BACK="$(detect_webcam)"
+    fi
+
+    if [[ -z "$CAMERA_BACK" ]]; then
+      echo "Nenhuma webcam física encontrada."
+      echo "Usando câmera traseira emulada."
+
+      CAMERA_BACK="emulated"
+      CAMERA_FRONT="none"
+    fi
+    ;;
+
+  virtual|emulated)
+    CAMERA_BACK="emulated"
+    CAMERA_FRONT="none"
+    ;;
+
+  none|off|no)
+    CAMERA_BACK="none"
+    CAMERA_FRONT="none"
+    ;;
+
+  image|imagefile)
+    if [[ -z "$IMAGE_FILE" ]]; then
+      echo "Para usar --camera image, informe:"
+      echo "  --image /caminho/arquivo.png"
+      exit 1
+    fi
+
+    IMAGE_FILE="${IMAGE_FILE/#\~/$HOME}"
+
+    if [[ ! -f "$IMAGE_FILE" ]]; then
+      echo "Imagem não encontrada: $IMAGE_FILE"
+      exit 1
+    fi
+
+    CAMERA_BACK="imagefile:$IMAGE_FILE"
+    CAMERA_FRONT="none"
+    ;;
+
+  *)
+    echo "Modo de câmera inválido: $CAMERA_MODE"
+    echo "Use: pc, virtual, none ou image"
+    exit 1
+    ;;
+esac
+
+WIPE_ARGS=()
+
+if [[ "$WIPE_DATA" == true ]]; then
+  WIPE_ARGS+=("-wipe-data")
+
+  echo
+  echo "ATENÇÃO:"
+  echo "Os aplicativos, arquivos e configurações do AVD serão apagados."
+  echo "A partição de dados será recriada com $DATA_PARTITION_SIZE."
+  echo
+fi
+
+echo "Abrindo emulador: $AVD"
+echo "Diretório do AVD: $AVD_DIR"
+echo "SDK: $SDK"
+echo "Câmera traseira: $CAMERA_BACK"
+echo "Câmera frontal: $CAMERA_FRONT"
+echo "Memória RAM: $MEMORY_MB MB | núcleos: $CORES"
+echo "Espaço interno: $DATA_PARTITION_SIZE"
+echo "GPU: $GPU_MODE"
+echo "Tela: ${LCD_WIDTH}x${LCD_HEIGHT} @ ${LCD_DENSITY} dpi ($RESOLUTION_LABEL)"
+echo "Vulkan: disabled"
+echo "Snapshot: disabled"
+
+sync_device_overlays_after_boot "$OVERLAY_ACTION" >/dev/null 2>&1 &
+
+exec "$EMULATOR" @"$AVD" \
+  -accel on \
+  -gpu "$GPU_MODE" \
+  -feature -Vulkan \
+  -no-snapshot \
+  -no-boot-anim \
+  -camera-back "$CAMERA_BACK" \
+  -camera-front "$CAMERA_FRONT" \
+  -memory "$MEMORY_MB" \
+  -cores "$CORES" \
+  -partition-size "$PARTITION_SIZE_MB" \
+  "${SKIN_ARGS[@]}" \
+  "${WIPE_ARGS[@]}" \
+  -no-audio

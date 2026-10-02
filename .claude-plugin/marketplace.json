@@ -1,0 +1,15 @@
+{
+  "name": "ubuntu-dev-machine",
+  "description": "Plugins para máquinas Ubuntu de desenvolvimento.",
+  "owner": {
+    "name": "PolizerBruno",
+    "url": "https://github.com/PolizerBruno"
+  },
+  "plugins": [
+    {
+      "name": "ubuntu-dev-machine",
+      "source": "./",
+      "description": "Diagnostica e corrige máquinas Ubuntu de desenvolvimento: memória e builds, disco, Slack no Wayland e Android Emulator no GNOME."
+    }
+  ]
+}

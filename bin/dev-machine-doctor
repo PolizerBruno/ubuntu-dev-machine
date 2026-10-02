@@ -1,0 +1,128 @@
+#!/bin/bash
+# Diagnóstico de uma máquina Ubuntu de desenvolvimento. Só lê, nunca muda nada. Cada linha começa com:
+#   ok    tudo certo
+#   !!    vale corrigir (diz como)
+#   --    informativo
+# Usado pela skill do Claude Code e por quem quiser rodar à mão.
+
+set -uo pipefail
+
+ok() { printf '  ok  %s\n' "$*"; }
+warn() { printf '  !!  %s\n' "$*"; }
+info() { printf '  --  %s\n' "$*"; }
+section() { printf '\n== %s\n' "$*"; }
+gb() { awk -v kb="$1" 'BEGIN {printf "%.1f GB", kb / 1048576}'; }
+size_kb() { du -sk "$1" 2>/dev/null | cut -f1; }
+
+section "Sistema"
+. /etc/os-release 2>/dev/null && info "${PRETTY_NAME:-?} | kernel $(uname -r) | sessão ${XDG_SESSION_TYPE:-?} | ${XDG_CURRENT_DESKTOP:-?}"
+read -r total avail < <(awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2} END {print t, a}' /proc/meminfo)
+read -r swap_total swap_free < <(awk '/^SwapTotal:/ {t = $2} /^SwapFree:/ {f = $2} END {print t, f}' /proc/meminfo)
+info "RAM $(gb "$total"), disponível $(gb "$avail") | swap $(gb $((swap_total - swap_free))) de $(gb "$swap_total") | swappiness $(cat /proc/sys/vm/swappiness)"
+psi=$(awk '/^full/ {split($2, a, "="); print a[2]}' /proc/pressure/memory 2>/dev/null)
+info "Pressão de memória (PSI full avg10): ${psi:-?}%"
+info "Disco /: $(df -h / | awk 'NR == 2 {print $4 " livres de " $2 " (" $5 " usado)"}')"
+
+section "Componentes deste repositório"
+for unit in dev-cleanup.timer dev-cleanup-watch.service; do
+  systemctl --user is-active --quiet "$unit" && ok "$unit ativo" || warn "$unit não está ativo (install.sh instala)"
+done
+for unit in snap-prune-disabled.timer apt-weekly-maintenance.timer; do
+  systemctl is-active --quiet "$unit" && ok "$unit ativo" || info "$unit não instalado (parte opcional, precisa de sudo)"
+done
+
+section "Memória e builds"
+if [ "$(findmnt -n -o FSTYPE /tmp 2>/dev/null)" = tmpfs ]; then
+  if [ -L "/tmp/$USER" ]; then
+    ok "/tmp é tmpfs e /tmp/$USER aponta para o disco (builds do EAS local fora da RAM)"
+  else
+    warn "/tmp é tmpfs (RAM): builds do eas-cli --local vão inteiros para a RAM; o dev-cleanup cria /tmp/$USER no disco"
+  fi
+  info "/tmp ocupando $(df -h --output=used /tmp | tail -1 | tr -d ' ') de RAM"
+else
+  ok "/tmp está no disco"
+fi
+gradle_daemons=$(ps -u "$USER" -o comm=,args= | awk '$1 == "java" && /GradleDaemon/' | wc -l)
+info "Daemons Gradle rodando: $gradle_daemons"
+props="$HOME/.gradle/gradle.properties"
+if grep -q '^org.gradle.daemon.idletimeout' "$props" 2>/dev/null; then
+  ok "Gradle encerra daemons ociosos ($(grep '^org.gradle.daemon.idletimeout' "$props"))"
+else
+  warn "Daemons do Gradle ficam 3h ociosos por padrão; install.sh pode pôr org.gradle.daemon.idletimeout=1800000"
+fi
+info "Maiores consumidores de RAM: $(ps -u "$USER" -o rss=,comm= |
+  awk '{r = $1; $1 = ""; m[substr($0, 2)] += r} END {for (c in m) printf "%d\t%s\n", m[c], c}' |
+  sort -rn | head -5 | awk -F'\t' '{printf "%s%s %.1f GB", s, $2, $1 / 1048576; s = ", "}')"
+
+section "Disco: caches e lixeiras"
+for dir in "$HOME/.cache/yarn" "$HOME/.npm/_cacache" "$HOME/.gradle/caches"; do
+  [ -d "$dir" ] && info "$dir: $(gb "$(size_kb "$dir")")"
+done
+for dir in "$HOME"/.gradle/caches/[0-9]*/; do
+  [ -d "$dir" ] || continue
+  last=$(find "$dir" -maxdepth 3 -printf '%TY-%Tm-%Td\n' 2>/dev/null | sort | tail -1)
+  info "  Gradle $(basename "$dir"): $(gb "$(size_kb "$dir")"), último uso $last"
+done
+trash_total=0
+while IFS= read -r dir; do
+  kb=$(size_kb "$dir")
+  trash_total=$((trash_total + ${kb:-0}))
+  [ "${kb:-0}" -ge 1048576 ] && warn "Lixeira escondida do snap: $dir ($(gb "$kb"))"
+done < <(find "$HOME/snap" -mindepth 5 -maxdepth 5 -type d -path '*/.local/share/Trash' 2>/dev/null)
+if [ "$trash_total" -ge 1048576 ]; then
+  warn "Lixeiras escondidas de apps snap somam $(gb "$trash_total"): não aparecem na lixeira do GNOME"
+else
+  ok "Lixeiras escondidas de apps snap: $(gb "$trash_total")"
+fi
+command -v snap >/dev/null && {
+  disabled=$(LANG=C snap list --all 2>/dev/null | awk 'NR > 1 && $NF ~ /disabled/' | wc -l)
+  [ "$disabled" -gt 0 ] && info "Revisões antigas de snaps guardadas: $disabled (snap-prune-disabled remove)" ||
+    ok "Nenhuma revisão antiga de snap guardada"
+}
+
+section "Atualizações do sistema"
+systemctl is-enabled --quiet unattended-upgrades 2>/dev/null && ok "unattended-upgrades ligado (segurança diária)" ||
+  warn "unattended-upgrades desligado"
+info "Pacotes para atualizar: $(apt list --upgradable 2>/dev/null | tail -n +2 | wc -l) | órfãos para autoremove: $(LANG=C apt-get -s autoremove 2>/dev/null | grep -c '^Remv')"
+[ -f /run/reboot-required ] && warn "Reinício pendente: $(tr '\n' ' ' </run/reboot-required.pkgs 2>/dev/null)"
+
+section "Vídeo (NVIDIA)"
+if dpkg-query -W -f='${Status}\n' 'nvidia-dkms-*' 2>/dev/null | grep -q 'install ok installed'; then
+  newest=$(find /boot -maxdepth 1 -name 'vmlinuz-*-generic' -printf '%f\n' | sed 's/^vmlinuz-//' | sort -V | tail -1)
+  if modinfo -k "$newest" nvidia >/dev/null 2>&1; then
+    ok "Driver NVIDIA via DKMS, módulo presente no kernel mais novo ($newest)"
+  else
+    warn "Driver NVIDIA via DKMS SEM módulo no kernel mais novo ($newest): não reinicie antes de rodar 'dkms status'"
+  fi
+elif lspci 2>/dev/null | grep -qi nvidia; then
+  info "Placa NVIDIA com driver empacotado (sem DKMS)"
+else
+  info "Sem placa NVIDIA"
+fi
+
+section "Apps"
+if [ -f /var/lib/snapd/desktop/applications/slack_slack.desktop ]; then
+  if [ -f "$HOME/.local/share/applications/slack_slack.desktop" ] &&
+    grep -q PIPEWIRE_CONFIG_DIR "$HOME/.local/share/applications/slack_slack.desktop"; then
+    ok "Slack snap com a correção do compartilhamento de tela"
+  else
+    warn "Slack snap: compartilhamento de tela no Wayland pode falhar; rode 'fix-slack-screenshare --check'"
+  fi
+fi
+if gsettings get org.gnome.mutter check-alive-timeout >/dev/null 2>&1; then
+  timeout=$(gsettings get org.gnome.mutter check-alive-timeout | awk '{print $NF}')
+  if [ "$timeout" = 0 ]; then
+    ok "GNOME não mostra o falso 'não está respondendo' (check-alive-timeout 0)"
+  elif [ -d "$HOME/.android/avd" ]; then
+    warn "Android Emulator no GNOME/Wayland mostra 'não está respondendo' por engano; veja o README (check-alive-timeout)"
+  fi
+fi
+for config in "$HOME"/.android/avd/*.avd/config.ini; do
+  [ -f "$config" ] || continue
+  avd=$(basename "$(dirname "$config")" .avd)
+  read -r width height density skin < <(awk -F= '
+    $1 == "hw.lcd.width" {w = $2} $1 == "hw.lcd.height" {h = $2} $1 == "hw.lcd.density" {d = $2}
+    $1 == "skin.name" {s = $2} END {print w, h, d, s}' "$config")
+  data_kb=$(size_kb "$(dirname "$config")")
+  info "AVD $avd: ${width}x${height} @ ${density} dpi, moldura ${skin:-nenhuma}, $(gb "${data_kb:-0}") em disco"
+done

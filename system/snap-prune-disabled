@@ -1,0 +1,23 @@
+#!/bin/bash
+# Remove as revisões desativadas dos snaps. O snapd guarda a versão anterior de cada app (refresh.retain, que
+# não aceita menos que 2) só para permitir "snap revert"; numa máquina com uns 20 snaps isso passa de 15
+# revisões guardadas. Instalado em /usr/local/sbin e rodado toda semana pelo snap-prune-disabled.timer,
+# porque precisa de root.
+
+set -uo pipefail
+
+# App aberto desde antes da atualização ainda roda da revisão antiga; remover a revisão por baixo dele
+# derruba o app. Fica para a semana seguinte.
+in_use() {
+  grep -qsF "/snap/$1/$2/" /proc/[0-9]*/maps
+}
+
+LANG=C snap list --all | awk 'NR > 1 && $NF ~ /disabled/ {print $1, $3}' |
+  while read -r name revision; do
+    if in_use "$name" "$revision"; then
+      echo "pulando $name revisão $revision: ainda em uso por algum processo"
+      continue
+    fi
+    echo "removendo $name revisão $revision"
+    snap remove "$name" --revision="$revision" || echo "  falhou, segue para o próximo"
+  done

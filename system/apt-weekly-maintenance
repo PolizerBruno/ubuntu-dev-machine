@@ -1,0 +1,68 @@
+#!/bin/bash
+# Manutenção semanal do apt. O unattended-upgrades do Ubuntu já instala as atualizações de segurança todo dia;
+# isto completa com as demais (-updates), remove pacotes órfãos e limpa os .deb baixados.
+# Instalado em /usr/local/sbin e rodado pelo apt-weekly-maintenance.timer, porque precisa de root.
+
+set -uo pipefail
+
+export DEBIAN_FRONTEND=noninteractive LANG=C
+# Lock::Timeout espera o apt-daily/unattended-upgrades largar o cadeado do dpkg em vez de falhar na hora.
+# force-confdef/confold mantêm a configuração local quando um pacote traz uma nova, sem perguntar.
+APT=(apt-get -y -q -o DPkg::Lock::Timeout=900 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+# Avisa todo usuário com sessão aberta (pelo D-Bus da sessão dele); roda como root, sem nome de usuário fixo.
+notify() {
+  local uid user
+  while read -r uid user; do
+    [ -S "/run/user/$uid/bus" ] || continue
+    runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+      notify-send -a "Atualização do sistema" -u "$1" -i "$2" "$3" "$4" || true
+  done < <(loginctl list-users --no-legend 2>/dev/null | awk '$1 >= 1000 {print $1, $2}')
+}
+
+# Linha de resumo do apt: "8 upgraded, 3 newly installed, 49 to remove and 0 not upgraded."
+apt_counts() {
+  grep -oE '^[0-9]+ upgraded, [0-9]+ newly installed, [0-9]+ to remove' <<<"$1" | head -1
+}
+
+if ! "${APT[@]}" update; then
+  notify critical dialog-error "Atualização semanal falhou" "O apt-get update falhou. Detalhes: journalctl -u apt-weekly-maintenance"
+  exit 1
+fi
+
+# --with-new-pkgs deixa entrar pacotes novos que uma atualização puxa (o kernel novo, por exemplo) e, ao
+# contrário do full-upgrade, nunca remove nada.
+upgrade_out=$("${APT[@]}" --with-new-pkgs upgrade 2>&1)
+upgrade_rc=$?
+echo "$upgrade_out"
+autoremove_out=$("${APT[@]}" autoremove --purge 2>&1)
+echo "$autoremove_out"
+"${APT[@]}" clean
+
+installed=$(apt_counts "$upgrade_out" | awk '{print $1 + $3}')
+removed=$(apt_counts "$autoremove_out" | awk '{print $6}')
+installed=${installed:-0}
+removed=${removed:-0}
+
+# Driver da NVIDIA via DKMS: cada kernel novo recompila o módulo. Se a compilação falhou, o boot no kernel novo
+# sobe sem a placa; melhor saber antes de reiniciar.
+newest_kernel=$(find /boot -maxdepth 1 -name 'vmlinuz-*-generic' -printf '%f\n' | sed 's/^vmlinuz-//' | sort -V | tail -1)
+nvidia_missing=false
+if dpkg-query -W -f='${Status}\n' 'nvidia-dkms-*' 2>/dev/null | grep -q 'install ok installed' &&
+  [ -n "$newest_kernel" ] && ! modinfo -k "$newest_kernel" nvidia >/dev/null 2>&1; then
+  nvidia_missing=true
+fi
+
+summary="$installed pacote(s) atualizado(s), $removed removido(s)."
+if [ "$upgrade_rc" -ne 0 ]; then
+  notify critical dialog-error "Atualização semanal falhou" \
+    "O apt-get upgrade terminou com erro. Detalhes: journalctl -u apt-weekly-maintenance"
+elif [ "$nvidia_missing" = true ]; then
+  notify critical dialog-warning "Não reinicie ainda: kernel $newest_kernel sem driver NVIDIA" \
+    "$summary O módulo da NVIDIA não foi compilado para o kernel novo; o próximo boot subiria sem a placa de vídeo. Veja: dkms status"
+elif [ -f /run/reboot-required ]; then
+  notify normal system-software-update "Sistema atualizado: reinicie quando puder" "$summary Há um kernel ou biblioteca nova esperando o reinício."
+elif [ "$installed" -gt 0 ] || [ "$removed" -gt 0 ]; then
+  notify normal system-software-update "Sistema atualizado" "$summary"
+fi
+exit "$upgrade_rc"

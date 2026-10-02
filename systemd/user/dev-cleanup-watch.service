@@ -1,0 +1,10 @@
+[Unit]
+Description=Vigia a memória e libera RAM de builds antes da máquina travar
+
+[Service]
+ExecStart=%h/.local/bin/dev-cleanup --watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

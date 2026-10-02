@@ -1,0 +1,10 @@
+[Unit]
+Description=Atualização semanal do apt (upgrade, autoremove, clean)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/apt-weekly-maintenance
+Nice=19
+IOSchedulingClass=idle
