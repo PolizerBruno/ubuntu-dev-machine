@@ -6,7 +6,7 @@
 #   --yes          aceita as respostas padrão sem perguntar
 #   --dry-run      mostra o que faria, sem mudar nada
 #   --only LISTA   instala só esses componentes, sem perguntar, separados por vírgula:
-#                  cleanup, gradle, emulador, gnome, slack, snaps, apt
+#                  cleanup, gradle, emulador, gnome, slack, skills, snaps, apt
 #
 # Sem terminal interativo (rodando pelo Claude, por exemplo) vale --yes: só os padrões, sem as partes de root.
 
@@ -16,6 +16,8 @@ REPO="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
 MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ubuntu-dev-machine/installed"
+SKILLS_REPO="${CLAUDE_SKILLS_REPO:-https://github.com/PolizerBruno/claude-skills.git}"
+SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$(xdg-user-dir DOCUMENTS 2>/dev/null || echo "$HOME/Documents")/GitHub/claude-skills}"
 ASSUME_YES=false
 DRY_RUN=false
 ONLY=""
@@ -190,7 +192,27 @@ else
   echo "   Slack snap não instalado; pulando."
 fi
 
-header "5. Partes de root (pedem a senha do sudo uma vez no fim)"
+header "5. Skills do Claude Code"
+cat <<EOF
+   Linka cada skill de $SKILLS_REPO em ~/.claude/skills, para o Claude Code
+   usar em todos os projetos. Clona em $SKILLS_DIR se ainda não estiver lá.
+   Outro repositório ou pasta: CLAUDE_SKILLS_REPO=url CLAUDE_SKILLS_DIR=pasta ./install.sh
+EOF
+# Desligado por padrão: o repositório padrão é privado. Liga sozinho quando o clone já existe.
+skills_default=n
+[ -d "$SKILLS_DIR" ] && skills_default=s
+if ask skills "   Instalar?" "$skills_default"; then
+  if [ ! -e "$SKILLS_DIR" ] && ! run git clone -q "$SKILLS_REPO" "$SKILLS_DIR"; then
+    echo "   Não consegui clonar $SKILLS_REPO. Se for privado: gh auth login && gh auth setup-git"
+  elif [ "$DRY_RUN" = true ] || [ -x "$SKILLS_DIR/install.sh" ]; then
+    run "$SKILLS_DIR/install.sh"
+    record skills
+  else
+    echo "   $SKILLS_DIR não tem install.sh; pulando."
+  fi
+fi
+
+header "6. Partes de root (pedem a senha do sudo uma vez no fim)"
 cat <<'EOF'
    snaps: remove toda semana as versões antigas guardadas dos snaps (pula as que ainda estão em uso).
    apt:   toda segunda 12:30, update + upgrade (sem remover pacotes) + autoremove + clean, com aviso no

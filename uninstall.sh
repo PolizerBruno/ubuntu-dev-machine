@@ -8,6 +8,7 @@ set -euo pipefail
 BIN="$HOME/.local/bin"
 UNITS="$HOME/.config/systemd/user"
 MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ubuntu-dev-machine/installed"
+SKILLS_DIR="${CLAUDE_SKILLS_DIR:-$(xdg-user-dir DOCUMENTS 2>/dev/null || echo "$HOME/Documents")/GitHub/claude-skills}"
 DRY_RUN=false
 case "${1:-}" in
   --dry-run | -n) DRY_RUN=true ;;
@@ -58,6 +59,14 @@ if installed slack; then
     run "$BIN/fix-slack-screenshare" --remove
   fi
   run rm -f "$BIN/fix-slack-screenshare"
+fi
+
+if installed skills; then
+  echo "== Skills do Claude Code"
+  # Tira só os links de ~/.claude/skills; o clone em $SKILLS_DIR fica, é onde as skills são editadas.
+  if [ -x "$SKILLS_DIR/install.sh" ]; then
+    run "$SKILLS_DIR/install.sh" --uninstall
+  fi
 fi
 
 if installed snaps; then

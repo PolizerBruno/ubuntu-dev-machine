@@ -49,6 +49,7 @@ Dependências dos avisos com botão (o resto funciona sem elas): `sudo apt insta
 | `emulador` | Script `emulador` (só se houver Android SDK) | não | sim |
 | `gnome` | `check-alive-timeout 0` (só no GNOME com Android SDK) | não | sim |
 | `slack` | Correção do compartilhamento de tela (só se o Slack snap precisar) | não | sim |
+| `skills` | Clona um repositório de skills do Claude Code em `~/Documentos/GitHub/claude-skills` e linka cada skill em `~/.claude/skills`. Repositório e pasta mudam com `CLAUDE_SKILLS_REPO` e `CLAUDE_SKILLS_DIR` | não | só se a pasta já existir |
 | `snaps` | Remoção semanal das revisões antigas de snaps | sim | não |
 | `apt` | Toda segunda 12:30: update, upgrade sem remover pacotes, autoremove, clean; avisa se o driver NVIDIA não compilou para o kernel novo | sim | não |
 
